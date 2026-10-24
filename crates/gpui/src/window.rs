@@ -1921,8 +1921,11 @@ impl Window {
 
                 handle
                     .update(&mut cx, |_, window, _| {
+                        // Presenting through high-rate input needs frames as well, which a
+                        // platform that pauses an idle window's frames delivers only when asked.
                         if window.invalidator.is_dirty()
                             || !window.next_frame_callbacks.borrow().is_empty()
+                            || window.input_rate_tracker.borrow().is_high_rate()
                         {
                             window.platform_window.schedule_frame();
                         }
@@ -8572,6 +8575,39 @@ mod tests {
         assert!(
             test_window.frame_wake_count() > baseline,
             "scheduling a next-frame callback in an idle window must wake the frame source"
+        );
+    }
+
+    /// GPUI keeps presenting for a second after high-rate input, so the display
+    /// does not clock down mid-gesture, and platforms that pause idle windows
+    /// deliver those frames only when one is scheduled.
+    #[gpui::test]
+    fn test_high_rate_input_schedules_frames(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| EmptyView);
+        let test_window = cx.test_window(window.into());
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        let baseline = test_window.schedule_frame_count();
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        assert_eq!(
+            test_window.schedule_frame_count(),
+            baseline,
+            "a clean window with no recent input must not schedule frames"
+        );
+
+        window
+            .update(cx, |_, window, _| {
+                let mut input_rate_tracker = window.input_rate_tracker.borrow_mut();
+                while !input_rate_tracker.is_high_rate() {
+                    input_rate_tracker.record_input();
+                }
+            })
+            .unwrap();
+        let baseline = test_window.schedule_frame_count();
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+
+        assert!(
+            test_window.schedule_frame_count() > baseline,
+            "a window presenting through high-rate input must schedule its next frame"
         );
     }
 

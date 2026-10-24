@@ -48,6 +48,7 @@ pub(crate) struct TestWindowState {
     appearance_change_callback: Option<Box<dyn FnMut()>>,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     frame_wake_count: Rc<Cell<usize>>,
+    schedule_frame_count: usize,
     frame_scheduled: bool,
     frame_callback_pending: bool,
     input_handler: Option<PlatformInputHandler>,
@@ -122,6 +123,7 @@ impl TestWindow {
             appearance_change_callback: None,
             request_frame_callback: None,
             frame_wake_count: Rc::new(Cell::new(0)),
+            schedule_frame_count: 0,
             frame_scheduled: false,
             frame_callback_pending: false,
             input_handler: None,
@@ -271,6 +273,12 @@ impl TestWindow {
     /// Returns how many times this window's frame waker has been invoked.
     pub fn frame_wake_count(&self) -> usize {
         self.0.lock().frame_wake_count.get()
+    }
+
+    /// Returns how many times GPUI has scheduled a frame for this window. Presenting a frame
+    /// also marks the next one scheduled here, which this count leaves out.
+    pub fn schedule_frame_count(&self) -> usize {
+        self.0.lock().schedule_frame_count
     }
 
     /// Delivers a frame request to the window, as the platform's frame source
@@ -497,6 +505,7 @@ impl PlatformWindow for TestWindow {
 
     fn schedule_frame(&self) {
         let mut state = self.0.lock();
+        state.schedule_frame_count += 1;
         if !state.frame_callback_pending {
             state.frame_scheduled = true;
         }
