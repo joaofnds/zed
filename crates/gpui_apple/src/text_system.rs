@@ -59,6 +59,10 @@ use crate::open_type::apply_features_and_fallbacks;
 #[allow(non_upper_case_globals)]
 const kCGImageAlphaOnly: u32 = 7;
 
+/// The sized fonts kept before all are dropped, so text in ever new sizes cannot grow the
+/// cache without bound.
+const SIZED_FONTS_MAX: usize = 256;
+
 /// Apple text system using CoreText for font shaping.
 pub struct AppleTextSystem(RwLock<AppleTextSystemState>);
 
@@ -77,7 +81,7 @@ struct AppleTextSystemState {
     font_ids_by_postscript_name: HashMap<String, FontId>,
     font_ids_by_font_key: HashMap<FontKey, SmallVec<[FontId; 4]>>,
     postscript_names_by_font_id: HashMap<FontId, String>,
-    // the sized copy of each font a line was shaped at, by font and size bits.
+    /// The sized copy of each font a line was shaped at, by the font and the bits of its size.
     sized_fonts: HashMap<(FontId, u32), CTFont>,
 }
 
@@ -572,8 +576,8 @@ impl AppleTextSystemState {
                 } else {
                     font_size
                 };
-                // reuse the sized copy, since CoreText makes each new copy afresh.
-                if self.sized_fonts.len() >= 256 {
+                // CoreText makes each sized copy afresh, so keep one per font and size.
+                if self.sized_fonts.len() >= SIZED_FONTS_MAX {
                     self.sized_fonts.clear();
                 }
                 let sized_font = self
@@ -850,6 +854,22 @@ mod tests {
         // There's no glyph for \u{feff}
         assert_eq!(layout.runs[0].glyphs[0].id, GlyphId(68u32)); // a
         assert_eq!(layout.runs[0].glyphs[1].id, GlyphId(69u32)); // b
+    }
+
+    #[test]
+    fn test_layout_line_at_two_sizes() {
+        let fonts = AppleTextSystem::new();
+        let font_id = fonts.font_id(&font("Helvetica")).unwrap();
+        let line = "office";
+        let run = FontRun {
+            font_id,
+            len: line.len(),
+        };
+
+        let small = fonts.layout_line(line, px(16.), &[run]);
+        let large = fonts.layout_line(line, px(32.), &[run]);
+
+        assert!(large.width > small.width);
     }
 
     #[test]
