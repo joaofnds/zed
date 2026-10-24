@@ -666,12 +666,7 @@ struct MacWindowState {
     cursor_style: CursorStyle,
     cursor_visible: Arc<AtomicBool>,
     frame_source: Option<WindowFrameSource>,
-    // whether GPUI asked for another frame since the last one, and how many frames
-    // in a row it has not.
-    frame_scheduled: bool,
-    idle_frames: u32,
-    // when the window last got input, which GPUI may keep presenting for a while after.
-    last_input: Option<std::time::Instant>,
+    display_link_idle: DisplayLinkIdle,
     renderer: renderer::Renderer,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     event_callback: Option<Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>>,
@@ -865,6 +860,12 @@ impl MacWindowState {
         if let Some(frame_source) = self.frame_source.as_mut() {
             frame_source.stop();
         }
+    }
+
+    fn is_display_link_running(&self) -> bool {
+        self.frame_source
+            .as_ref()
+            .is_some_and(WindowFrameSource::is_running)
     }
 
     fn is_maximized(&self) -> bool {
@@ -1107,9 +1108,7 @@ impl MacWindow {
                 cursor_style: CursorStyle::Arrow,
                 cursor_visible,
                 frame_source: None,
-                frame_scheduled: false,
-                idle_frames: 0,
-                last_input: None,
+                display_link_idle: DisplayLinkIdle::default(),
                 renderer: renderer::new_renderer(
                     renderer_context,
                     native_window as *mut _,
@@ -2033,14 +2032,12 @@ impl PlatformWindow for MacWindow {
         self.0.as_ref().lock().request_frame_callback = Some(callback);
     }
 
-    // GPUI calls this when the window will want another frame.
     fn schedule_frame(&self) {
         if let Some(mut lock) = self.0.try_lock() {
-            lock.frame_scheduled = true;
+            lock.display_link_idle.schedule_frame();
         }
     }
 
-    // GPUI calls this when an idle window gets frame demand.
     fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
         let state = Arc::downgrade(&self.0);
         Some(Rc::new(move || {
@@ -2685,10 +2682,7 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
     };
 
     let run_callback = |event: PlatformInput| -> BOOL {
-        let mut lock = window_state.as_ref().lock();
-        lock.last_input = Some(std::time::Instant::now());
-        let mut callback = lock.event_callback.take();
-        drop(lock);
+        let mut callback = window_state.as_ref().lock().event_callback.take();
         let handled: BOOL = if let Some(callback) = callback.as_mut() {
             !callback(event).propagate as BOOL
         } else {
@@ -2967,7 +2961,6 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
             _ => {}
         }
 
-        lock.last_input = Some(std::time::Instant::now());
         if let Some(mut callback) = lock.event_callback.take() {
             drop(lock);
             callback(event);
@@ -3371,50 +3364,68 @@ extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
     }
 }
 
-// frames in a row with no demand before the display link pauses.
 const IDLE_FRAMES_BEFORE_PAUSE: u32 = 4;
 
-// GPUI keeps presenting for a second after high-rate input, so the display does not clock down
-// mid-gesture. The display link keeps ticking that long after any input.
-const INPUT_PRESENT_HOLD: Duration = Duration::from_secs(1);
+/// Counts the frames in a row that ended with no frame scheduled after them, so a window's
+/// display link can pause once GPUI wants no frames.
+#[derive(Default)]
+struct DisplayLinkIdle {
+    frame_scheduled: bool,
+    idle_frames: u32,
+}
 
-// restart a display link paused while the window was idle and draw the frame that
-// woke it at once. GPUI wakes the window from inside an update, so the draw waits on the main
-// queue for that update to end, and the restarted link's first tick would land a frame or more
-// after it.
+impl DisplayLinkIdle {
+    fn schedule_frame(&mut self) {
+        self.frame_scheduled = true;
+    }
+
+    fn wake(&mut self) {
+        self.idle_frames = 0;
+    }
+
+    /// Counts the frame that just ended, and tells whether the display link should pause.
+    fn end_frame(&mut self) -> bool {
+        if mem::take(&mut self.frame_scheduled) {
+            self.idle_frames = 0;
+            return false;
+        }
+
+        self.idle_frames += 1;
+        if self.idle_frames < IDLE_FRAMES_BEFORE_PAUSE {
+            return false;
+        }
+        self.idle_frames = 0;
+        true
+    }
+}
+
+// Restart a display link paused while the window was idle and draw the frame that woke it at
+// once. GPUI wakes the window from inside an update, so the draw waits on the main queue for
+// that update to end, and the restarted link's first tick would land a frame or more after it.
 fn wake_display_link(state: Arc<Mutex<MacWindowState>>) {
     if let Some(mut lock) = state.try_lock() {
-        lock.idle_frames = 0;
-        if lock
-            .frame_source
-            .as_ref()
-            .is_some_and(WindowFrameSource::is_running)
-        {
+        lock.display_link_idle.wake();
+        if lock.is_display_link_running() {
             return;
         }
     }
+    // SAFETY: `wake_display_link_async` takes this reference back with `Arc::from_raw`, and the
+    // main queue runs it once.
     let context = Arc::into_raw(state) as *mut c_void;
     unsafe { DispatchQueue::main().exec_async_f(context, wake_display_link_async) };
 }
 
 extern "C" fn wake_display_link_async(context: *mut c_void) {
+    // SAFETY: `wake_display_link` made `context` with `Arc::into_raw`.
     let state = unsafe { Arc::from_raw(context as *const Mutex<MacWindowState>) };
     let mut lock = state.lock();
-    lock.idle_frames = 0;
-    if lock
-        .frame_source
-        .as_ref()
-        .is_some_and(WindowFrameSource::is_running)
-    {
+    lock.display_link_idle.wake();
+    if lock.is_display_link_running() {
         return;
     }
     lock.start_display_link();
     // A hidden window, or one AppKit reports on no screen, starts no link and draws nothing.
-    if !lock
-        .frame_source
-        .as_ref()
-        .is_some_and(WindowFrameSource::is_running)
-    {
+    if !lock.is_display_link_running() {
         return;
     }
     let Some(mut callback) = lock.request_frame_callback.take() else {
@@ -3450,18 +3461,8 @@ extern "C" fn step(view: *mut c_void) {
         });
         let mut lock = window_state.lock();
         lock.request_frame_callback = Some(callback);
-        // pause the display link once GPUI has wanted no frame for a few frames.
-        let input_held = lock
-            .last_input
-            .is_some_and(|at| at.elapsed() < INPUT_PRESENT_HOLD);
-        if std::mem::take(&mut lock.frame_scheduled) || input_held {
-            lock.idle_frames = 0;
-        } else {
-            lock.idle_frames += 1;
-            if lock.idle_frames >= IDLE_FRAMES_BEFORE_PAUSE {
-                lock.idle_frames = 0;
-                lock.stop_display_link();
-            }
+        if lock.display_link_idle.end_frame() {
+            lock.stop_display_link();
         }
     }
 }
@@ -3836,7 +3837,6 @@ async fn synthetic_drag(
             lock.synthetic_drag_counter += 1;
             break;
         }
-        lock.last_input = Some(std::time::Instant::now());
         if let Some(mut callback) = lock.event_callback.take() {
             drop(lock);
             callback(PlatformInput::MouseMove(event.clone()));
@@ -4067,5 +4067,50 @@ mod tests {
     #[test]
     fn display_id_for_screen_returns_none_for_null_screen() {
         assert_eq!(display_id_for_screen(nil), None);
+    }
+
+    fn end_frames(idle: &mut DisplayLinkIdle, count: u32) -> Vec<bool> {
+        (0..count).map(|_| idle.end_frame()).collect()
+    }
+
+    #[test]
+    fn display_link_pauses_after_four_frames_with_none_scheduled() {
+        let mut idle = DisplayLinkIdle::default();
+
+        let pauses = end_frames(&mut idle, 4);
+
+        assert_eq!(pauses, [false, false, false, true]);
+    }
+
+    #[test]
+    fn display_link_counts_again_after_a_scheduled_frame() {
+        let mut idle = DisplayLinkIdle::default();
+        end_frames(&mut idle, 3);
+        idle.schedule_frame();
+
+        let pauses = end_frames(&mut idle, 5);
+
+        assert_eq!(pauses, [false, false, false, false, true]);
+    }
+
+    #[test]
+    fn display_link_counts_again_after_a_wake() {
+        let mut idle = DisplayLinkIdle::default();
+        end_frames(&mut idle, 3);
+        idle.wake();
+
+        let pauses = end_frames(&mut idle, 4);
+
+        assert_eq!(pauses, [false, false, false, true]);
+    }
+
+    #[test]
+    fn display_link_counts_again_after_it_pauses() {
+        let mut idle = DisplayLinkIdle::default();
+        end_frames(&mut idle, 4);
+
+        let pauses = end_frames(&mut idle, 4);
+
+        assert_eq!(pauses, [false, false, false, true]);
     }
 }
