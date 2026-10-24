@@ -77,6 +77,8 @@ struct AppleTextSystemState {
     font_ids_by_postscript_name: HashMap<String, FontId>,
     font_ids_by_font_key: HashMap<FontKey, SmallVec<[FontId; 4]>>,
     postscript_names_by_font_id: HashMap<FontId, String>,
+    // the sized copy of each font a line was shaped at, by font and size bits.
+    sized_fonts: HashMap<(FontId, u32), CTFont>,
 }
 
 impl AppleTextSystem {
@@ -90,6 +92,7 @@ impl AppleTextSystem {
             font_ids_by_postscript_name: HashMap::default(),
             font_ids_by_font_key: HashMap::default(),
             postscript_names_by_font_id: HashMap::default(),
+            sized_fonts: HashMap::default(),
         }))
     }
 }
@@ -569,12 +572,16 @@ impl AppleTextSystemState {
                 } else {
                     font_size
                 };
+                // reuse the sized copy, since CoreText makes each new copy afresh.
+                if self.sized_fonts.len() >= 256 {
+                    self.sized_fonts.clear();
+                }
+                let sized_font = self
+                    .sized_fonts
+                    .entry((run.font_id, f32::from(font_size).to_bits()))
+                    .or_insert_with(|| font.native_font().clone_with_font_size(font_size.into()));
                 unsafe {
-                    string.set_attribute(
-                        cf_range,
-                        kCTFontAttributeName,
-                        &font.native_font().clone_with_font_size(font_size.into()),
-                    );
+                    string.set_attribute(cf_range, kCTFontAttributeName, &*sized_font);
                 }
                 break_ligature = !break_ligature;
             }
