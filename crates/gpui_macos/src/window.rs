@@ -1408,6 +1408,8 @@ impl Drop for MacWindow {
         // A delivery task queued by `report_visibility` may still run after the
         // GPUI window is gone; without a callback it has nothing to notify.
         this.visibility_callback.take();
+        // So may a wake queued by the frame waker, which restarts no link without one.
+        this.request_frame_callback.take();
         this.foreground_executor
             .spawn(async move {
                 unsafe {
@@ -3420,7 +3422,9 @@ extern "C" fn wake_display_link_async(context: *mut c_void) {
     let state = unsafe { Arc::from_raw(context as *const Mutex<MacWindowState>) };
     let mut lock = state.lock();
     lock.display_link_idle.wake();
-    if lock.is_display_link_running() {
+    // `MacWindow::drop` takes the frame callback, and a wake queued before it would otherwise
+    // start a link on the closing window and draw a frame GPUI no longer has a window for.
+    if lock.request_frame_callback.is_none() || lock.is_display_link_running() {
         return;
     }
     lock.start_display_link();
