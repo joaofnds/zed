@@ -844,16 +844,20 @@ impl MetalRenderer {
             .as_ref()
             .context("missing path intermediate texture")?;
 
-        let mut vertices = Vec::new();
-        for path in paths {
-            vertices.extend(path.vertices.iter().map(|v| PathRasterizationVertex {
+        let vertex_count = paths.iter().map(|path| path.vertices.len()).sum::<usize>();
+        let (vertex_instance_bindings, slots) =
+            writer.allocate::<PathRasterizationVertex>(vertex_count)?;
+        let vertices = paths.iter().flat_map(|path| {
+            path.vertices.iter().map(move |v| PathRasterizationVertex {
                 xy_position: v.xy_position,
                 st_position: v.st_position,
                 color: path.color,
                 bounds: path.bounds.intersect(&path.content_mask.bounds),
-            }));
+            })
+        });
+        for (slot, vertex) in slots.iter_mut().zip(vertices) {
+            slot.write(vertex);
         }
-        let vertex_instance_bindings = writer.write(&vertices)?;
 
         let render_pass_descriptor = metal::RenderPassDescriptor::new();
         let color_attachment = render_pass_descriptor
@@ -889,11 +893,7 @@ impl MetalRenderer {
             Some(&vertex_instance_bindings.buffer),
             vertex_instance_bindings.offset as u64,
         );
-        command_encoder.draw_primitives(
-            metal::MTLPrimitiveType::Triangle,
-            0,
-            vertices.len() as u64,
-        );
+        command_encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, vertex_count as u64);
 
         command_encoder.end_encoding();
         Ok(true)
@@ -1728,6 +1728,7 @@ impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::{Pixels, Rgba, px, rgb};
     use objc2_core_foundation::{CFDictionary, CFType};
     use objc2_core_video::{
         CVPixelBufferCreate, CVPixelBufferGetBaseAddressOfPlane,
@@ -1798,5 +1799,35 @@ mod tests {
             assert!(blue.abs_diff(128) <= 2);
             assert_eq!(*alpha, 255);
         }
+    }
+
+    #[test]
+    fn render_paths_of_one_batch_in_their_own_colors() {
+        let mut scene = Scene::default();
+        scene.insert_primitive(triangle(point(px(0.), px(0.)), rgb(0xff0000)));
+        scene.insert_primitive(triangle(point(px(16.), px(0.)), rgb(0x0000ff)));
+        scene.finish();
+
+        let mut renderer = MetalRenderer::new_headless(Arc::new(Mutex::new(Default::default())));
+        let image = renderer
+            .render_scene_to_image(&scene, size(DevicePixels(32), DevicePixels(16)))
+            .unwrap();
+
+        assert_eq!(image.get_pixel(4, 12), &image::Rgba([255, 0, 0, 255]));
+        assert_eq!(image.get_pixel(20, 12), &image::Rgba([0, 0, 255, 255]));
+        assert_eq!(image.get_pixel(12, 4), &image::Rgba([0, 0, 0, 255]));
+        assert_eq!(image.get_pixel(28, 4), &image::Rgba([0, 0, 0, 255]));
+    }
+
+    fn triangle(origin: Point<Pixels>, color: Rgba) -> Path<ScaledPixels> {
+        let mut path = Path::new(origin);
+        path.line_to(origin + point(px(0.), px(16.)));
+        path.line_to(origin + point(px(16.), px(16.)));
+        let mut path = path.scale(1.);
+        path.content_mask = ContentMask {
+            bounds: path.bounds,
+        };
+        path.color = color.into();
+        path
     }
 }
