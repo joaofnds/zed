@@ -845,18 +845,20 @@ impl MetalRenderer {
             .context("missing path intermediate texture")?;
 
         let vertex_count = paths.iter().map(|path| path.vertices.len()).sum::<usize>();
-        let (vertex_instance_bindings, slots) =
+        let (vertex_instance_bindings, mut slots) =
             writer.allocate::<PathRasterizationVertex>(vertex_count)?;
-        let vertices = paths.iter().flat_map(|path| {
-            path.vertices.iter().map(move |v| PathRasterizationVertex {
-                xy_position: v.xy_position,
-                st_position: v.st_position,
-                color: path.color,
-                bounds: path.bounds.intersect(&path.content_mask.bounds),
-            })
-        });
-        for (slot, vertex) in slots.iter_mut().zip(vertices) {
-            slot.write(vertex);
+        for path in paths {
+            let (path_slots, remaining_slots) = slots.split_at_mut(path.vertices.len());
+            slots = remaining_slots;
+            let bounds = path.clipped_bounds();
+            for (slot, vertex) in path_slots.iter_mut().zip(&path.vertices) {
+                slot.write(PathRasterizationVertex {
+                    xy_position: vertex.xy_position,
+                    st_position: vertex.st_position,
+                    color: path.color,
+                    bounds,
+                });
+            }
         }
 
         let render_pass_descriptor = metal::RenderPassDescriptor::new();
@@ -1803,26 +1805,100 @@ mod tests {
 
     #[test]
     fn render_paths_of_one_batch_in_their_own_colors() {
+        let image = render_paths(
+            [
+                triangle(point(px(0.), px(0.)), rgb(0xff0000)),
+                triangle(point(px(16.), px(0.)), rgb(0x0000ff)),
+            ],
+            size(DevicePixels(32), DevicePixels(16)),
+        );
+
+        assert_eq!(image.get_pixel(4, 12), &RED);
+        assert_eq!(image.get_pixel(20, 12), &BLUE);
+        assert_eq!(image.get_pixel(12, 4), &BLACK);
+        assert_eq!(image.get_pixel(28, 4), &BLACK);
+    }
+
+    #[test]
+    fn render_paths_of_one_batch_with_different_vertex_counts() {
+        let image = render_paths(
+            [
+                triangle(point(px(0.), px(0.)), rgb(0xff0000)),
+                square(point(px(16.), px(0.)), rgb(0x0000ff)),
+            ],
+            size(DevicePixels(32), DevicePixels(16)),
+        );
+
+        assert_eq!(image.get_pixel(4, 12), &RED);
+        assert_eq!(image.get_pixel(12, 4), &BLACK);
+        assert_eq!(image.get_pixel(20, 12), &BLUE);
+        assert_eq!(image.get_pixel(28, 4), &BLUE);
+    }
+
+    #[test]
+    fn render_overlapping_paths_inside_their_content_masks() {
+        let mut masked = square(point(px(0.), px(0.)), rgb(0xff0000));
+        masked.content_mask.bounds.size.width = ScaledPixels(8.);
+        let overlapping = triangle(point(px(4.), px(0.)), rgb(0x0000ff));
+
+        let image = render_paths(
+            [masked, overlapping],
+            size(DevicePixels(32), DevicePixels(16)),
+        );
+
+        assert_eq!(image.get_pixel(2, 8), &RED);
+        assert_eq!(image.get_pixel(12, 14), &BLUE);
+        assert_eq!(image.get_pixel(14, 4), &BLACK);
+    }
+
+    const RED: image::Rgba<u8> = image::Rgba([255, 0, 0, 255]);
+    const BLUE: image::Rgba<u8> = image::Rgba([0, 0, 255, 255]);
+    const BLACK: image::Rgba<u8> = image::Rgba([0, 0, 0, 255]);
+
+    fn render_paths(
+        paths: impl IntoIterator<Item = Path<ScaledPixels>>,
+        viewport_size: Size<DevicePixels>,
+    ) -> RgbaImage {
         let mut scene = Scene::default();
-        scene.insert_primitive(triangle(point(px(0.), px(0.)), rgb(0xff0000)));
-        scene.insert_primitive(triangle(point(px(16.), px(0.)), rgb(0x0000ff)));
+        for path in paths {
+            scene.insert_primitive(path);
+        }
         scene.finish();
 
-        let mut renderer = MetalRenderer::new_headless(Arc::new(Mutex::new(Default::default())));
-        let image = renderer
-            .render_scene_to_image(&scene, size(DevicePixels(32), DevicePixels(16)))
-            .unwrap();
-
-        assert_eq!(image.get_pixel(4, 12), &image::Rgba([255, 0, 0, 255]));
-        assert_eq!(image.get_pixel(20, 12), &image::Rgba([0, 0, 255, 255]));
-        assert_eq!(image.get_pixel(12, 4), &image::Rgba([0, 0, 0, 255]));
-        assert_eq!(image.get_pixel(28, 4), &image::Rgba([0, 0, 0, 255]));
+        MetalRenderer::new_headless(Arc::new(Mutex::new(Default::default())))
+            .render_scene_to_image(&scene, viewport_size)
+            .unwrap()
     }
 
     fn triangle(origin: Point<Pixels>, color: Rgba) -> Path<ScaledPixels> {
+        filled_path(
+            origin,
+            &[point(px(0.), px(16.)), point(px(16.), px(16.))],
+            color,
+        )
+    }
+
+    fn square(origin: Point<Pixels>, color: Rgba) -> Path<ScaledPixels> {
+        filled_path(
+            origin,
+            &[
+                point(px(0.), px(16.)),
+                point(px(16.), px(16.)),
+                point(px(16.), px(0.)),
+            ],
+            color,
+        )
+    }
+
+    fn filled_path(
+        origin: Point<Pixels>,
+        corners: &[Point<Pixels>],
+        color: Rgba,
+    ) -> Path<ScaledPixels> {
         let mut path = Path::new(origin);
-        path.line_to(origin + point(px(0.), px(16.)));
-        path.line_to(origin + point(px(16.), px(16.)));
+        for corner in corners {
+            path.line_to(origin + *corner);
+        }
         let mut path = path.scale(1.);
         path.content_mask = ContentMask {
             bounds: path.bounds,
